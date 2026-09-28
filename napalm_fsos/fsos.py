@@ -41,6 +41,7 @@ class FsosDriver(NetworkDriver):
 
     def __init__(self, hostname, username, password, timeout=60, optional_args=None):
         """Constructor."""
+        log.debug("__init__ - called with hostname=%s, username=%s, timeout=%s", hostname, username, timeout)
         self.hostname = hostname
         self.username = username
         self.password = password
@@ -52,10 +53,18 @@ class FsosDriver(NetworkDriver):
         self.port = optional_args.get("port", 23)
         self.global_delay_factor = optional_args.get("global_delay_factor", 1)
         self.use_keys = optional_args.get("use_keys", False)
+        log.debug("__init__ - optional_args=%s, port=%s, global_delay_factor=%s, use_keys=%s",
+                  optional_args, self.port, self.global_delay_factor, self.use_keys)
 
         self._tn = None
         self._connected = False
         self._config_lock = False
+        self._prompt = None  # Detected device prompt (e.g., 'SHOP-AG1_20SQ#')
+        log.debug("__init__ - complete")
+
+    def _is_at_prompt(self, output):
+        """Check if output ends with a CLI prompt (# for privileged, > for user mode)."""
+        return bool(re.search(r"\S+[#>]\s*$", output, re.MULTILINE))
 
     def _strip_telnet(self, data):
         """Remove telnet IAC (Interpret As Command) negotiation bytes."""
@@ -73,7 +82,7 @@ class FsosDriver(NetworkDriver):
         return bytes(result)
 
     def _socket_read(self, prompt=None):
-        """Read data from socket until *prompt* (or FS#/FS>) appears.
+        """Read data from socket until *prompt* (or a CLI prompt ending with # or >) appears.
 
         Reads in chunks with a socket timeout, accumulating data.
         Returns as soon as the prompt is found.
@@ -82,15 +91,23 @@ class FsosDriver(NetworkDriver):
         self._sock.settimeout(30.0)
         safety = 0
         max_safety = 200
+        print(f"[DEBUG] _socket_read - starting, prompt={prompt!r}", flush=True)
+        log.debug("_socket_read - starting, prompt=%r", prompt)
 
         while safety < max_safety:
             safety += 1
             try:
                 chunk = self._sock.recv(65536)
                 if not chunk:
+                    print(f"[DEBUG] _socket_read: connection closed after {len(data)} bytes", flush=True)
                     log.debug("_socket_read: connection closed after %d bytes", len(data))
                     break
                 data += chunk
+                print(f"[DEBUG] _socket_read: received {len(chunk)} bytes (total {len(data)}), last 200 hex: {data[-200:]!r}", flush=True)
+                log.debug(
+                    "_socket_read: received %d bytes (total %d), raw hex: %r",
+                    len(chunk), len(data), data[-200:],
+                )
                 if prompt is not None:
                     if prompt.encode() in data:
                         log.debug(
@@ -98,13 +115,37 @@ class FsosDriver(NetworkDriver):
                             prompt, len(data),
                         )
                         break
-                elif b"FS#" in data or b"FS>" in data:
-                    log.debug(
-                        "_socket_read: found prompt after %d bytes",
-                        len(data),
-                    )
-                    break
+                else:
+                    # Detect CLI prompt: any line ending with # or > (e.g., 'SHOP-AG1_20SQ#')
+                    decoded = data.decode("utf-8", errors="replace")
+                    # Look for a prompt pattern: non-whitespace chars followed by # or > at end of line
+                    prompt_match = re.search(r"\S+[#>]\s*$", decoded, re.MULTILINE)
+                    if prompt_match:
+                        detected_prompt = prompt_match.group(0).strip()
+                        # Store the detected prompt for future use
+                        if self._prompt is None:
+                            self._prompt = detected_prompt
+                            log.debug("_socket_read: detected new prompt: %r", self._prompt)
+                        log.debug(
+                            "_socket_read: found CLI prompt '%s' after %d bytes",
+                            detected_prompt, len(data),
+                        )
+                        break
+                    else:
+                        # Check for common prompts even when no explicit prompt is set
+                        common_prompts = ["Password:", "password:", "Enter password:", "Enable password:"]
+                        found_common = [p for p in common_prompts if p.lower() in decoded.lower()]
+                        if found_common:
+                            log.debug(
+                                "_socket_read: found common prompt(s) %s after %d bytes (no CLI prompt yet)",
+                                found_common, len(data),
+                            )
+                        log.debug(
+                            "_socket_read: no CLI prompt yet, looking for # or >, safety=%d, total=%d bytes",
+                            safety, len(data),
+                        )
             except socket.timeout:
+                print(f"[DEBUG] _socket_read: timeout after {len(data)} bytes, safety={safety}", flush=True)
                 log.debug(
                     "_socket_read: timeout after %d bytes, safety=%d",
                     len(data), safety,
@@ -120,11 +161,17 @@ class FsosDriver(NetworkDriver):
                     f"Did not receive prompt '{prompt}' after reading {len(data)} bytes"
                 )
 
-        return self._strip_telnet(data).decode("utf-8", errors="replace")
+        result = self._strip_telnet(data).decode("utf-8", errors="replace")
+        log.debug("_socket_read - complete: %d bytes, result (%d chars): %r", len(data), len(result), result[:500])
+        return result
 
     def _socket_write(self, command):
         """Write command to socket connection."""
+        print(f"[DEBUG] _socket_write - sending: {command!r}", flush=True)
+        log.debug("_socket_write - sending: %r", command)
         self._sock.send((command + "\r").encode("utf-8"))
+        print(f"[DEBUG] _socket_write - sent {len(command) + 1} bytes", flush=True)
+        log.debug("_socket_write - sent %d bytes", len(command) + 1)
 
     def _is_mocked(self):
         """Check if we're using a test double."""
@@ -132,74 +179,106 @@ class FsosDriver(NetworkDriver):
 
     def _send_command(self, command):
         """Send a CLI command and return the output (stripped of echo and prompt)."""
+        log.debug("_send_command - command: %r", command)
         if self._is_mocked():
             result = self.device.run_commands([command], encoding="text")
-            return result[0].get("output", "")
+            output = result[0].get("output", "")
+            log.debug("_send_command - mocked output (%d bytes): %r", len(output), output[:500])
+            return output
         self._socket_write(command)
         output = self._socket_read()
-        # Remove command echo and trailing prompt
+        log.debug("_send_command - raw output (%d bytes): %r", len(output), output[:500])
+        # Remove command echo and trailing prompt (any # or > prompt)
         output = re.sub(rf"^{re.escape(command)}\s*\n", "", output, flags=re.MULTILINE)
-        output = re.sub(r"\nFS#\s*$", "", output)
-        output = re.sub(r"\nFS>\s*$", "", output)
+        output = re.sub(r"\n\S+[#>]\s*$", "", output)
+        log.debug("_send_command - cleaned output (%d bytes): %r", len(output), output[:500])
         return output
 
     def open(self):
         """Open telnet connection to the device."""
+        print(f"[DEBUG] open - starting connection to {self.hostname}:{self.port}", flush=True)
+        log.debug("open - starting connection to %s:%s", self.hostname, self.port)
         if self._is_mocked():
+            log.debug("open - mocked mode, setting connected=True")
             self._connected = True
             return
         try:
+            log.debug("open - creating socket")
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._sock.settimeout(self.timeout)
+            log.debug("open - connecting to %s:%s", self.hostname, self.port)
             self._sock.connect((self.hostname, self.port))
-        except Exception:
+            log.debug("open - socket connected")
+        except Exception as exc:
+            log.debug("open - connection failed: %s", exc)
             raise ConnectionException(f"Unable to connect to host {self.hostname}")
 
         # Read initial banner — wait for the Username: prompt
+        log.debug("open - reading banner (waiting for Username: prompt)")
         output = self._socket_read(prompt="Username:")
-        if "FS>" not in output and "FS#" not in output:
-            log.debug("Banner output: %s", output[:200])
+        log.debug("open - banner output (%d bytes): %r", len(output), output[:500])
+        if not self._is_at_prompt(output):
+            log.debug("open - banner output: %s", output[:200])
 
         # Login
+        log.debug("open - sending username: %r", self.username)
         self._socket_write(self.username)
+        log.debug("open - waiting for Password: prompt")
         self._socket_read(prompt="Password:")
 
+        log.debug("open - sending password")
         self._socket_write(self.password)
+        log.debug("open - waiting for post-login output")
         output = self._socket_read()
+        log.debug("open - post-login output (%d bytes): %r", len(output), output[:500])
 
         # Enter enable mode
+        log.debug("open - sending 'enable' command")
         self._socket_write("enable")
+        log.debug("open - waiting for enable output")
         output = self._socket_read()
+        log.debug("open - enable output (%d bytes): %r", len(output), output[:500])
 
         # Check if we're already in enable mode or need password
-        if "FS#" not in output:
+        if not self._is_at_prompt(output):
+            log.debug("open - not at CLI prompt yet, trying enable password")
             # Try sending enable password (often same as login or empty)
             self._socket_write(self.password)
             output = self._socket_read()
+            log.debug("open - after enable password output (%d bytes): %r", len(output), output[:500])
 
-        if "FS#" not in output:
+        if not self._is_at_prompt(output):
+            log.debug("open - still not at CLI prompt, trying empty password")
             # Try empty password
             self._socket_write("")
             output = self._socket_read()
+            log.debug("open - after empty password output (%d bytes): %r", len(output), output[:500])
 
-        if "FS#" not in output:
+        if not self._is_at_prompt(output):
+            log.debug("open - FAILED to enter enable mode")
             raise ConnectionException(f"Failed to enter enable mode. Output: {output[:200]}")
 
+        log.debug("open - in enable mode, disabling pagination")
         # Disable pagination
         self._send_command("terminal length 0")
 
         self._connected = True
+        log.debug("open - connection established, _connected=True")
 
     def close(self):
         """Close socket connection."""
+        log.debug("close - called, _connected=%s", self._connected)
         if hasattr(self, "_sock") and self._sock:
             try:
+                log.debug("close - closing socket")
                 self._sock.close()
-            except Exception:
+            except Exception as exc:
+                log.debug("close - error closing socket: %s", exc)
                 pass
             self._sock = None
         self._connected = False
         self._config_lock = False
+        log.debug("close - complete")
 
     def is_alive(self):
         """Return if connected."""
@@ -216,7 +295,9 @@ class FsosDriver(NetworkDriver):
 
     def get_facts(self):
         """Return facts about the network device."""
+        log.debug("get_facts - starting")
         output = self._send_command("show version")
+        log.debug("get_facts - show version output (%d bytes): %r", len(output), output[:1000])
 
         facts = {}
 
@@ -268,17 +349,23 @@ class FsosDriver(NetworkDriver):
         facts["vendor"] = "FS.COM"
 
         # Parse interface list from show interfaces
+        log.debug("get_facts - fetching interface list")
         iface_output = self._send_command("show interfaces")
+        log.debug("get_facts - show interfaces output (%d bytes): %r", len(iface_output), iface_output[:1000])
         iface_pattern = re.compile(
             r"={20,}\s*(.+?)\s*={20,}", re.MULTILINE
         )
         facts["interface_list"] = [m.group(1) for m in iface_pattern.finditer(iface_output)]
+        log.debug("get_facts - found interfaces: %s", facts["interface_list"])
 
+        log.debug("get_facts - returning facts: %s", facts)
         return facts
 
     def get_interfaces(self):
         """Return interfaces details."""
+        log.debug("get_interfaces - starting")
         output = self._send_command("show interfaces")
+        log.debug("get_interfaces - raw output (%d bytes): %r", len(output), output[:2000])
 
         interfaces = {}
 
@@ -337,13 +424,17 @@ class FsosDriver(NetworkDriver):
                 iface_data["description"] = m.group(1).strip()
 
             interfaces[iface_name] = iface_data
+            log.debug("get_interfaces - parsed %s: %s", iface_name, iface_data)
 
+        log.debug("get_interfaces - returning %d interfaces: %s", len(interfaces), list(interfaces.keys()))
         return interfaces
 
     def get_interfaces_ip(self):
         """Return IP address information for interfaces."""
+        log.debug("get_interfaces_ip - starting")
         interfaces_ip = {}
         output = self._send_command("show interfaces")
+        log.debug("get_interfaces_ip - raw output (%d bytes): %r", len(output), output[:2000])
 
         iface_pattern = re.compile(
             r"={20,}\s*(.+?)\s*={20,}", re.MULTILINE
@@ -387,6 +478,7 @@ class FsosDriver(NetworkDriver):
 
             interfaces_ip[iface_name] = {"ipv4": ipv4, "ipv6": ipv6}
 
+        log.debug("get_interfaces_ip - returning: %s", interfaces_ip)
         return interfaces_ip
 
     def _mask_to_prefix(self, mask):
@@ -422,7 +514,9 @@ class FsosDriver(NetworkDriver):
 
     def get_interfaces_counters(self):
         """Return interfaces counters."""
+        log.debug("get_interfaces_counters - starting")
         output = self._send_command("show interfaces")
+        log.debug("get_interfaces_counters - raw output (%d bytes): %r", len(output), output[:2000])
         counters = {}
 
         iface_pattern = re.compile(
@@ -470,12 +564,16 @@ class FsosDriver(NetworkDriver):
                 counter["tx_errors"] = int(m.group(1))
 
             counters[iface_name] = counter
+            log.debug("get_interfaces_counters - parsed %s: %s", iface_name, counter)
 
+        log.debug("get_interfaces_counters - returning %d counters", len(counters))
         return counters
 
     def get_vlans(self):
         """Return VLAN information."""
+        log.debug("get_vlans - starting")
         output = self._send_command("show vlan")
+        log.debug("get_vlans - raw output (%d bytes): %r", len(output), output[:2000])
         vlans = {}
 
         # Parse VLAN table
@@ -506,11 +604,14 @@ class FsosDriver(NetworkDriver):
                 "interfaces": ports,
             }
 
+        log.debug("get_vlans - returning %d vlans", len(vlans))
         return vlans
 
     def get_lldp_neighbors(self):
         """Return LLDP neighbors information."""
+        log.debug("get_lldp_neighbors - starting")
         output = self._send_command("show lldp neighbors")
+        log.debug("get_lldp_neighbors - raw output (%d bytes): %r", len(output), output[:2000])
         neighbors = {}
 
         # Parse LLDP neighbors table using header-driven column detection.
@@ -571,10 +672,12 @@ class FsosDriver(NetworkDriver):
                     }
                 )
 
+        log.debug("get_lldp_neighbors - returning %d neighbors", len(neighbors))
         return neighbors
 
     def get_config(self, retrieve="all", full=False, sanitized=False, format="text"):
         """Return configuration sections."""
+        log.debug("get_config - retrieve=%s", retrieve)
         configs = {
             "running": "",
             "startup": "",
@@ -584,12 +687,15 @@ class FsosDriver(NetworkDriver):
         # Load running config once if needed
         running_config = ""
         if retrieve in ("running", "all"):
+            log.debug("get_config - fetching running config")
             output = self._send_command("show running-config")
+            log.debug("get_config - raw output (%d bytes): %r", len(output), output[:2000])
             # Remove the command echo, header lines, and trailing prompt
             running_config = re.sub(r"^show running-config\s*\n", "", output, flags=re.MULTILINE)
             running_config = re.sub(r"^Building configuration\.\.\.\s*\n", "", running_config, flags=re.MULTILINE)
             running_config = re.sub(r"^Current configuration:\s*\d+\s*bytes\s*\n", "", running_config, flags=re.MULTILINE)
-            running_config = re.sub(r"\nFS#\s*$", "", running_config)
+            running_config = re.sub(r"\n\S+[#>]\s*$", "", running_config)
+            log.debug("get_config - cleaned config (%d bytes): %r", len(running_config), running_config[:2000])
 
         if retrieve == "running":
             configs["running"] = running_config
@@ -602,11 +708,15 @@ class FsosDriver(NetworkDriver):
             configs["startup"] = running_config
             configs["candidate"] = ""
 
+        log.debug("get_config - returning configs: running=%d bytes, startup=%d bytes, candidate=%d bytes",
+                  len(configs["running"]), len(configs["startup"]), len(configs["candidate"]))
         return configs
 
     def get_snmp_information(self):
         """Return SNMP information."""
+        log.debug("get_snmp_information - starting")
         output = self._send_command("show snmp")
+        log.debug("get_snmp_information - raw output (%d bytes): %r", len(output), output[:2000])
         snmp = {
             "chassis_id": "",
             "community": {},
@@ -619,11 +729,14 @@ class FsosDriver(NetworkDriver):
         if m:
             snmp["chassis_id"] = m.group(1)
 
+        log.debug("get_snmp_information - returning: %s", snmp)
         return snmp
 
     def get_users(self):
         """Return users information."""
+        log.debug("get_users - starting")
         output = self._send_command("show running-config")
+        log.debug("get_users - raw output (%d bytes): %r", len(output), output[:2000])
         users = {}
 
         # Parse username lines
@@ -641,10 +754,12 @@ class FsosDriver(NetworkDriver):
                 "sshkeys": [],
             }
 
+        log.debug("get_users - returning %d users", len(users))
         return users
 
     def get_environment(self):
         """Return environment information."""
+        log.debug("get_environment - starting")
         environment = {
             "cpu": {},
             "memory": {
@@ -657,11 +772,14 @@ class FsosDriver(NetworkDriver):
         }
 
         # Parse CPU usage from show cpu — handle multiple slots
+        log.debug("get_environment - fetching show cpu")
         cpu_output = self._send_command("show cpu")
+        log.debug("get_environment - show cpu output (%d bytes): %r", len(cpu_output), cpu_output[:2000])
         cpu_usages = re.findall(
             r"CPU utilization in five seconds:\s*([\d.]+)%",
             cpu_output,
         )
+        log.debug("get_environment - CPU usages found: %s", cpu_usages)
         if cpu_usages:
             # Use the maximum CPU usage across all slots
             max_usage = max(float(u) for u in cpu_usages)
@@ -672,7 +790,9 @@ class FsosDriver(NetworkDriver):
             }
 
         # Parse memory from show memory
+        log.debug("get_environment - fetching show memory")
         mem_output = self._send_command("show memory")
+        log.debug("get_environment - show memory output (%d bytes): %r", len(mem_output), mem_output[:2000])
         m = re.search(
             r"System Memory:\s+(\d+)KB\s+total,\s+(\d+)KB\s+used,\s+(\d+)KB\s+free",
             mem_output,
@@ -683,6 +803,7 @@ class FsosDriver(NetworkDriver):
                 "available_ram": int(m.group(3)),
             }
 
+        log.debug("get_environment - returning: %s", environment)
         return environment
 
     def get_ntp_peers(self):
@@ -748,7 +869,9 @@ class FsosDriver(NetworkDriver):
 
     def get_arp_table(self, vrf=""):
         """Return ARP table."""
+        log.debug("get_arp_table - starting, vrf=%r", vrf)
         output = self._send_command("show arp")
+        log.debug("get_arp_table - raw output (%d bytes): %r", len(output), output[:2000])
         arp_table = []
 
         # Parse ARP table
@@ -779,6 +902,7 @@ class FsosDriver(NetworkDriver):
                 }
             )
 
+        log.debug("get_arp_table - returning %d entries", len(arp_table))
         return arp_table
 
     def get_ipv6_neighbors_table(self):
@@ -787,7 +911,9 @@ class FsosDriver(NetworkDriver):
 
     def get_route_to(self, destination="", protocol="", longer=False):
         """Return routing information for a destination."""
+        log.debug("get_route_to - destination=%r, protocol=%r, longer=%s", destination, protocol, longer)
         output = self._send_command("show ip route")
+        log.debug("get_route_to - raw output (%d bytes): %r", len(output), output[:2000])
         routes_by_prefix = {}
 
         # Parse route entries
@@ -831,16 +957,20 @@ class FsosDriver(NetworkDriver):
                 routes_by_prefix[prefix] = []
             routes_by_prefix[prefix].append(route)
 
+        log.debug("get_route_to - returning %d prefixes", len(routes_by_prefix))
         return routes_by_prefix
 
     def ping(self, destination, source="", ttl=255, timeout=2, size=100, count=5, vrf="", source_interface=""):
         """Execute ping."""
+        log.debug("ping - destination=%r, source=%r, size=%d, count=%d, timeout=%d", destination, source, size, count, timeout)
         cmd = f"ping {destination} ntimes {count} length {size} timeout {timeout}"
         if source:
             cmd += f" source {source}"
         if source_interface:
             cmd += f" source-interface {source_interface}"
+        log.debug("ping - executing command: %r", cmd)
         output = self._send_command(cmd)
+        log.debug("ping - raw output (%d bytes): %r", len(output), output[:2000])
 
         # Parse ping output
         success_pattern = re.search(r"Success rate is\s+(\d+)%", output)
@@ -859,6 +989,20 @@ class FsosDriver(NetworkDriver):
                 }
             }
 
+        log.debug("ping - success rate: %s%%", pct)
+        return {
+            "success": {
+                "probes_sent": count,
+                "packet_loss": 100,
+                "rtt_min": 0.0,
+                "rtt_max": 0.0,
+                "rtt_avg": 0.0,
+                "rtt_stddev": 0.0,
+                "results": [],
+            }
+        }
+
+        log.debug("ping - packet loss: 100%%")
         return {
             "success": {
                 "probes_sent": count,
@@ -873,8 +1017,11 @@ class FsosDriver(NetworkDriver):
 
     def traceroute(self, destination, source="", ttl=255, timeout=2, vrf=""):
         """Execute traceroute."""
+        log.debug("traceroute - destination=%r, ttl=%d, timeout=%d", destination, ttl, timeout)
         cmd = f"traceroute ip {destination} ttl 1 {ttl} timeout {timeout}"
+        log.debug("traceroute - executing command: %r", cmd)
         output = self._send_command(cmd)
+        log.debug("traceroute - raw output (%d bytes): %r", len(output), output[:2000])
 
         # Parse traceroute output
         success = {}
@@ -901,14 +1048,17 @@ class FsosDriver(NetworkDriver):
                 }
             }
 
+        log.debug("traceroute - returning %d hops", len(success))
         return {"success": success}
 
     def get_optics(self):
         """Return optics information for all interfaces."""
+        log.debug("get_optics - starting")
         # FSOS doesn't have a working show opticals command
         # Return proper structure with default values
         optics = {}
         output = self._send_command("show interfaces")
+        log.debug("get_optics - show interfaces output (%d bytes): %r", len(output), output[:2000])
 
         iface_pattern = re.compile(
             r"={20,}\s*(.+?)\s*={20,}", re.MULTILINE
@@ -968,11 +1118,14 @@ class FsosDriver(NetworkDriver):
                 }
             }
 
+        log.debug("get_optics - returning optics for %d interfaces", len(optics))
         return optics
 
     def get_lldp_neighbors_detail(self, interface=""):
         """Return detailed LLDP neighbors information."""
+        log.debug("get_lldp_neighbors_detail - starting, interface=%r", interface)
         output = self._send_command("show lldp neighbors detail")
+        log.debug("get_lldp_neighbors_detail - raw output (%d bytes): %r", len(output), output[:2000])
         neighbors = {}
 
         # Parse LLDP neighbors detail
@@ -1050,52 +1203,65 @@ class FsosDriver(NetworkDriver):
                 neighbors[local_intf] = []
             neighbors[local_intf].append(neighbor)
 
+        log.debug("get_lldp_neighbors_detail - returning %d interfaces with neighbors", len(neighbors))
         return neighbors
 
     def cli(self, commands, encoding="text"):
         """Return arbitrary CLI output."""
+        log.debug("cli - commands=%r, encoding=%s", commands, encoding)
         result = {}
         if isinstance(commands, str):
             commands = [commands]
         for cmd in commands:
+            log.debug("cli - executing: %r", cmd)
             output = self._send_command(cmd)
             # Remove command echo and prompt
             output = re.sub(rf"^{re.escape(cmd)}\s*\n", "", output, flags=re.MULTILINE)
-            output = re.sub(r"\nFS#\s*$", "", output)
+            output = re.sub(r"\n\S+[#>]\s*$", "", output)
             result[cmd] = output.strip()
+            log.debug("cli - result for %r (%d bytes): %r", cmd, len(output), output[:500])
+        log.debug("cli - returning %d results", len(result))
         return result
 
     def load_replace_candidate(self, filename=None, config=None):
         """Replace running config with new config."""
+        log.debug("load_replace_candidate - filename=%r, config_len=%s", filename, len(config) if config else None)
         if config is not None:
             self._running_config = config
         elif filename is not None:
             with open(filename, "r") as f:
                 self._running_config = f.read()
+        log.debug("load_replace_candidate - stored config: %d bytes", len(self._running_config))
 
     def load_merge_candidate(self, filename=None, config=None):
         """Merge running config with new config."""
+        log.debug("load_merge_candidate - filename=%r, config_len=%s", filename, len(config) if config else None)
         if config is not None:
             self._running_config = config
         elif filename is not None:
             with open(filename, "r") as f:
                 self._running_config = f.read()
+        log.debug("load_merge_candidate - stored config: %d bytes", len(self._running_config))
 
     def compare_config(self):
         """Compare candidate config with running config."""
+        log.debug("compare_config - called")
         return ""
 
     def commit_config(self, message="", revert_in=None):
         """Commit the candidate configuration."""
+        log.debug("commit_config - message=%r, revert_in=%s", message, revert_in)
         # FSOS applies config immediately, no commit needed
         return ""
 
     def discard_config(self):
         """Discard the candidate configuration."""
+        log.debug("discard_config - called")
         pass
 
     def rollback(self):
         """Rollback to a previous configuration."""
+        log.debug("rollback - called, raising NotImplementedError")
         raise NotImplementedError("FSOS does not support rollback")
 
     pass  # save_config not in base class, removed
