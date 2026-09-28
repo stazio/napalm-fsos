@@ -1015,32 +1015,34 @@ class FsosDriver(NetworkDriver):
             }
 
             # Parse fields — use re.MULTILINE + ^ to anchor to line start,
-            # and [^\n]+ to capture only within the current line
-            m = re.search(r"^\s*Chassis ID\s+:\s+([^\n]+)", block, re.MULTILINE)
+            # and [^\n]+ to capture only within the current line.
+            # Use [ \t]+ instead of \s+ after ':' so we don't cross line boundaries
+            # when a field value is empty (\s matches newlines).
+            m = re.search(r"^\s*Chassis ID\s+:[ \t]+([^\n]+)", block, re.MULTILINE)
             if m:
                 neighbor["remote_chassis_id"] = m.group(1).strip()
 
-            m = re.search(r"^\s*System name\s+:\s+([^\n]+)", block, re.MULTILINE)
+            m = re.search(r"^\s*System name\s+:[ \t]+([^\n]+)", block, re.MULTILINE)
             if m:
                 neighbor["remote_system_name"] = m.group(1).strip()
 
-            m = re.search(r"^\s*System description\s+:\s+([^\n]+)", block, re.MULTILINE)
+            m = re.search(r"^\s*System description\s+:[ \t]+([^\n]+)", block, re.MULTILINE)
             if m:
                 neighbor["remote_system_description"] = m.group(1).strip()
 
-            m = re.search(r"^\s*System capabilities supported\s+:\s+([^\n]+)", block, re.MULTILINE)
+            m = re.search(r"^\s*System capabilities supported\s+:[ \t]+([^\n]+)", block, re.MULTILINE)
             if m:
                 neighbor["remote_system_capab"] = [m.group(1).strip()]
 
-            m = re.search(r"^\s*System capabilities enabled\s+:\s+([^\n]+)", block, re.MULTILINE)
+            m = re.search(r"^\s*System capabilities enabled\s+:[ \t]+([^\n]+)", block, re.MULTILINE)
             if m:
                 neighbor["remote_system_enable_capab"] = [m.group(1).strip()]
 
-            m = re.search(r"^\s*Port ID\s+:\s+([^\n]+)", block, re.MULTILINE)
+            m = re.search(r"^\s*Port ID\s+:[ \t]+([^\n]+)", block, re.MULTILINE)
             if m:
                 neighbor["remote_port"] = m.group(1).strip()
 
-            m = re.search(r"^\s*Port description\s+:\s+([^\n]+)", block, re.MULTILINE)
+            m = re.search(r"^\s*Port description\s+:[ \t]+([^\n]+)", block, re.MULTILINE)
             if m:
                 neighbor["remote_port_description"] = m.group(1).strip()
 
