@@ -85,17 +85,31 @@ class FsosDriver(NetworkDriver):
         """Read data from socket until *prompt* (or a CLI prompt ending with # or >) appears.
 
         Reads in chunks with a socket timeout, accumulating data.
-        Returns as soon as the prompt is found.
+        Returns as soon as the prompt is found, or when the total elapsed
+        time exceeds read_timeout_seconds.
         """
         data = b""
         self._sock.settimeout(30.0)
-        safety = 0
-        max_safety = 200
+        read_start = __import__("time").time()
+        read_timeout_seconds = 300  # 5 minutes total for very large outputs
         print(f"[DEBUG] _socket_read - starting, prompt={prompt!r}", flush=True)
         log.debug("_socket_read - starting, prompt=%r", prompt)
 
-        while safety < max_safety:
-            safety += 1
+        while True:
+            # Check total elapsed time
+            elapsed = __import__("time").time() - read_start
+            if elapsed > read_timeout_seconds:
+                print(
+                    f"[DEBUG] _socket_read: total timeout after {elapsed:.0f}s, "
+                    f"{len(data)} bytes received",
+                    flush=True,
+                )
+                log.debug(
+                    "_socket_read: total timeout after %.0f seconds, %d bytes",
+                    elapsed, len(data),
+                )
+                break
+
             try:
                 chunk = self._sock.recv(65536)
                 if not chunk:
@@ -141,16 +155,16 @@ class FsosDriver(NetworkDriver):
                                 found_common, len(data),
                             )
                         log.debug(
-                            "_socket_read: no CLI prompt yet, looking for # or >, safety=%d, total=%d bytes",
-                            safety, len(data),
+                            "_socket_read: no CLI prompt yet, looking for # or >, elapsed=%.1fs, total=%d bytes",
+                            elapsed, len(data),
                         )
             except socket.timeout:
-                print(f"[DEBUG] _socket_read: timeout after {len(data)} bytes, safety={safety}", flush=True)
+                print(f"[DEBUG] _socket_read: timeout after {len(data)} bytes, elapsed={elapsed:.1f}s", flush=True)
                 log.debug(
-                    "_socket_read: timeout after %d bytes, safety=%d",
-                    len(data), safety,
+                    "_socket_read: timeout after %d bytes, elapsed=%.1f seconds",
+                    len(data), elapsed,
                 )
-                break
+                continue  # keep reading instead of breaking
             except Exception as exc:
                 log.debug("_socket_read: exception %s after %d bytes", exc, len(data))
                 break
