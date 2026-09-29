@@ -1152,6 +1152,7 @@ class FsosDriver(NetworkDriver):
         #   System capabilities enabled       : Bridge
         #   Port ID                           : Port 42
         #   Port description                  : D223-Conference Table
+        #   Management address                : 10.0.0.1
         #   Aging time                        : 1minutes 47seconds
 
         # Split by port blocks
@@ -1179,6 +1180,7 @@ class FsosDriver(NetworkDriver):
                 "remote_system_description": "",
                 "remote_system_capab": [],
                 "remote_system_enable_capab": [],
+                "_mgmt_address": "",
             }
 
             # Parse fields — use re.MULTILINE + ^ to anchor to line start,
@@ -1212,6 +1214,10 @@ class FsosDriver(NetworkDriver):
             m = re.search(r"^\s*Port description\s+:[ \t]+([^\n]+)", block, re.MULTILINE)
             if m:
                 neighbor["remote_port_description"] = m.group(1).strip()
+
+            m = re.search(r"^\s*Management address\s+:[ \t]+([^\n]+)", block, re.MULTILINE)
+            if m:
+                neighbor["_mgmt_address"] = m.group(1).strip()
 
             if local_intf not in neighbors:
                 neighbors[local_intf] = []
