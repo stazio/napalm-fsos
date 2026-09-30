@@ -618,7 +618,9 @@ class FsosDriver(NetworkDriver):
     def get_lldp_neighbors(self):
         """Return LLDP neighbors information."""
         log.debug("get_lldp_neighbors - starting")
-        output = self._send_command("show lldp neighbors")
+        output = self._send_command(
+            "show lldp neighbors | regexp include System Name|Total"
+        )
         log.debug("get_lldp_neighbors - raw output (%d bytes): %r", len(output), output[:2000])
         neighbors = {}
 
@@ -1132,7 +1134,9 @@ class FsosDriver(NetworkDriver):
     def get_lldp_neighbors_detail(self, interface=""):
         """Return detailed LLDP neighbors information."""
         log.debug("get_lldp_neighbors_detail - starting, interface=%r", interface)
-        output = self._send_command("show lldp neighbors detail")
+        output = self._send_command(
+            "show lldp neighbors detail | regexp include LLDP neighbor-information|Chassis ID|System name|System description|System capabilities|Port ID|Port description|Management address|Aging time"
+        )
         log.debug("get_lldp_neighbors_detail - raw output (%d bytes): %r", len(output), output[:2000])
         neighbors = {}
 
