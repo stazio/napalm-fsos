@@ -92,18 +92,12 @@ class FsosDriver(NetworkDriver):
         self._sock.settimeout(30.0)
         read_start = __import__("time").time()
         read_timeout_seconds = 300  # 5 minutes total for very large outputs
-        print(f"[DEBUG] _socket_read - starting, prompt={prompt!r}", flush=True)
         log.debug("_socket_read - starting, prompt=%r", prompt)
 
         while True:
             # Check total elapsed time
             elapsed = __import__("time").time() - read_start
             if elapsed > read_timeout_seconds:
-                print(
-                    f"[DEBUG] _socket_read: total timeout after {elapsed:.0f}s, "
-                    f"{len(data)} bytes received",
-                    flush=True,
-                )
                 log.debug(
                     "_socket_read: total timeout after %.0f seconds, %d bytes",
                     elapsed, len(data),
@@ -113,11 +107,9 @@ class FsosDriver(NetworkDriver):
             try:
                 chunk = self._sock.recv(65536)
                 if not chunk:
-                    print(f"[DEBUG] _socket_read: connection closed after {len(data)} bytes", flush=True)
                     log.debug("_socket_read: connection closed after %d bytes", len(data))
                     break
                 data += chunk
-                print(f"[DEBUG] _socket_read: received {len(chunk)} bytes (total {len(data)}), last 200 hex: {data[-200:]!r}", flush=True)
                 log.debug(
                     "_socket_read: received %d bytes (total %d), raw hex: %r",
                     len(chunk), len(data), data[-200:],
@@ -159,7 +151,6 @@ class FsosDriver(NetworkDriver):
                             elapsed, len(data),
                         )
             except socket.timeout:
-                print(f"[DEBUG] _socket_read: timeout after {len(data)} bytes, elapsed={elapsed:.1f}s", flush=True)
                 log.debug(
                     "_socket_read: timeout after %d bytes, elapsed=%.1f seconds",
                     len(data), elapsed,
@@ -181,10 +172,8 @@ class FsosDriver(NetworkDriver):
 
     def _socket_write(self, command):
         """Write command to socket connection."""
-        print(f"[DEBUG] _socket_write - sending: {command!r}", flush=True)
         log.debug("_socket_write - sending: %r", command)
         self._sock.send((command + "\r").encode("utf-8"))
-        print(f"[DEBUG] _socket_write - sent {len(command) + 1} bytes", flush=True)
         log.debug("_socket_write - sent %d bytes", len(command) + 1)
 
     def _is_mocked(self):
@@ -210,7 +199,6 @@ class FsosDriver(NetworkDriver):
 
     def open(self):
         """Open telnet connection to the device."""
-        print(f"[DEBUG] open - starting connection to {self.hostname}:{self.port}", flush=True)
         log.debug("open - starting connection to %s:%s", self.hostname, self.port)
         if self._is_mocked():
             log.debug("open - mocked mode, setting connected=True")
@@ -364,7 +352,7 @@ class FsosDriver(NetworkDriver):
 
         # Parse interface list from show interfaces
         log.debug("get_facts - fetching interface list")
-        iface_output = self._send_command("show interfaces")
+        iface_output = self._send_command("show interfaces | regexp include ===")
         log.debug("get_facts - show interfaces output (%d bytes): %r", len(iface_output), iface_output[:1000])
         iface_pattern = re.compile(
             r"={20,}\s*(.+?)\s*={20,}", re.MULTILINE
@@ -378,7 +366,9 @@ class FsosDriver(NetworkDriver):
     def get_interfaces(self):
         """Return interfaces details."""
         log.debug("get_interfaces - starting")
-        output = self._send_command("show interfaces")
+        output = self._send_command(
+            "show interfaces | regexp include ===|is UP|is DOWN|address is|MTU|oper speed|Description:"
+        )
         log.debug("get_interfaces - raw output (%d bytes): %r", len(output), output[:2000])
 
         interfaces = {}
@@ -447,7 +437,9 @@ class FsosDriver(NetworkDriver):
         """Return IP address information for interfaces."""
         log.debug("get_interfaces_ip - starting")
         interfaces_ip = {}
-        output = self._send_command("show interfaces")
+        output = self._send_command(
+            "show interfaces | regexp include ===|is UP|is DOWN|address is|MTU|oper speed|Description:|Interface address is:|Interface IPv6 address is:|Subnet mask:|No IPv6 address"
+        )
         log.debug("get_interfaces_ip - raw output (%d bytes): %r", len(output), output[:2000])
 
         iface_pattern = re.compile(
@@ -529,7 +521,9 @@ class FsosDriver(NetworkDriver):
     def get_interfaces_counters(self):
         """Return interfaces counters."""
         log.debug("get_interfaces_counters - starting")
-        output = self._send_command("show interfaces")
+        output = self._send_command(
+            "show interfaces | regexp include ===|packets input|packets output|input errors|output errors|input discards|output discards"
+        )
         log.debug("get_interfaces_counters - raw output (%d bytes): %r", len(output), output[:2000])
         counters = {}
 
@@ -1071,7 +1065,7 @@ class FsosDriver(NetworkDriver):
         # FSOS doesn't have a working show opticals command
         # Return proper structure with default values
         optics = {}
-        output = self._send_command("show interfaces")
+        output = self._send_command("show interfaces | regexp include ===")
         log.debug("get_optics - show interfaces output (%d bytes): %r", len(output), output[:2000])
 
         iface_pattern = re.compile(
